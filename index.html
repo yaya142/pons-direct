@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Direct</title>
+<meta name="description" content="Le market cap d'un token, relu sur la chaîne à chaque seconde — la page ⚡ ouverte depuis une alerte du bot.">
+<!--
+  LA PAGE « ⚡ INSTANTANÉ » — ouverte depuis une alerte, dans Telegram.
+
+  Pourquoi une page : Telegram plafonne les éditions de message à ~20/min par
+  chat, donc le 🔄 Direct ne peut pas descendre sous ~5 s. Une page, elle,
+  n'a pas de quota : elle relit la chaîne toutes les secondes.
+
+  Pourquoi SANS SERVEUR : tout ce qu'il faut est public. Le bot met dans
+  l'URL ce qu'il sait du token (chaîne, courbe ou pool, paire, supply, dev) ;
+  la page fait ses `eth_call` sur le RPC public depuis le navigateur, et lit
+  ETH/USD et BNB/USD sur DeFiLlama (CORS ouvert). Aucune clé, aucun secret :
+  la page peut être hébergée n'importe où en HTTPS.
+
+  Paramètres (query) :
+    t     token (0x…)          sym   symbole            nom  nom
+    k     courbe | v4 | pancake
+    ch    robinhood | base | bnb
+    c     courbe pons V2 (k=courbe)
+    pid   poolId (k=v4)        sv    StateView (k=v4)   t0   1 si le token est currency0
+    pool  paire Pancake (k=pancake)
+    q     quote : 0x0 = natif (ETH/BNB) ; sinon l'adresse ; qd = décimales de la quote
+    s     supply en wei (défaut 1e27)
+    dev   adresse du dev (part détenue)
+-->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #111; --muted: #6b7280; --card: #f3f4f6; --up: #16a34a; --down: #dc2626; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0f1115; --fg: #f3f4f6; --muted: #9ca3af; --card: #1a1d24; }
+  }
+  :root[data-theme="dark"] { --bg: #0f1115; --fg: #f3f4f6; --muted: #9ca3af; --card: #1a1d24; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--tg-theme-bg-color, var(--bg)); color: var(--tg-theme-text-color, var(--fg)); font: 16px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .cap { font-size: 44px; font-weight: 700; letter-spacing: -0.02em; margin: 18px 0 2px; font-variant-numeric: tabular-nums; }
+  .cap.up { color: var(--up); } .cap.down { color: var(--down); }
+  .eth { color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
+  .card { background: var(--tg-theme-secondary-bg-color, var(--card)); border-radius: 12px; padding: 10px 12px; }
+  .card .l { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .foot { margin-top: 18px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--up); margin-right: 6px; vertical-align: middle; }
+  .dot.off { background: var(--down); }
+  code { font-size: 12px; }
+  .spark { width: 100%; height: 56px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<h1 id="titre">…</h1>
+<div class="sub"><code id="ca"></code></div>
+<div class="cap" id="cap">—</div>
+<div class="eth" id="capEth"></div>
+<svg class="spark" id="spark" viewBox="0 0 300 56" preserveAspectRatio="none"></svg>
+<div class="grid">
+  <div class="card"><div class="l" id="lDev">Dev</div><div class="v" id="dev">—</div></div>
+  <div class="card"><div class="l">Bloc</div><div class="v" id="bloc">—</div></div>
+  <div class="card"><div class="l">Depuis l'ouverture</div><div class="v" id="delta">—</div></div>
+  <div class="card"><div class="l">Plus haut / plus bas</div><div class="v" id="hl">—</div></div>
+</div>
+<div class="foot"><span><span class="dot" id="dot"></span><span id="etat">connexion…</span></span><span id="heure"></span></div>
+<script>
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+  const P = new URLSearchParams(location.search);
+  const g = (k, d) => (P.get(k) === null ? d : P.get(k));
+  const token = (g("t", "") || "").toLowerCase();
+  const kind = g("k", "v4"), ch = g("ch", "robinhood");
+  const quote = (g("q", "0x0000000000000000000000000000000000000000") || "").toLowerCase();
+  const quoteDec = Number(g("qd", "18"));
+  const supply = BigInt(g("s", "1000000000000000000000000000"));
+  const dev = (g("dev", "") || "").toLowerCase();
+  const NATIF = /^0x0+$/.test(quote);
+  const RPC = { robinhood: "https://rpc.mainnet.chain.robinhood.com", base: "https://mainnet.base.org", bnb: "https://bsc-rpc.publicnode.com" }[ch];
+  const UNITE = ch === "bnb" ? "BNB" : "ETH";
+  const STABLES = new Set(["0x5fc5360d0400a0fd4f2af552add042d716f1d168", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"]); // USDG, USDC
+  const sym = g("sym", "?"), nom = g("nom", "");
+  document.getElementById("titre").textContent = `${nom ? nom + " · " : ""}$${sym}`;
+  document.getElementById("ca").textContent = token;
+  const $ = (id) => document.getElementById(id);
+  const fmtUsd = (v) => v >= 1000 ? "$" + Math.round(v).toLocaleString("en-US") : "$" + v.toLocaleString("en-US", { maximumSignificantDigits: 3 });
+  const fmtPct = (v) => v.toLocaleString("en-US", { maximumFractionDigits: 1 }) + " %";
+
+  // ── RPC minimal : eth_call et eth_blockNumber, sans bibliothèque ──
+  let id = 0;
+  async function rpc(method, params) {
+    const r = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || "rpc");
+    return j.result;
+  }
+  const call = (to, data) => rpc("eth_call", [{ to, data }, "latest"]);
+  const pad = (h) => h.replace(/^0x/, "").padStart(64, "0");
+  const words = (hex) => (hex.replace(/^0x/, "").match(/.{64}/g) || []).map((w) => BigInt("0x" + w));
+
+  // ── Prix natif en dollars (DeFiLlama, CORS ouvert), toutes les 60 s ──
+  let natifUsd = null;
+  async function litNatifUsd() {
+    try {
+      const idl = ch === "bnb" ? "coingecko:binancecoin" : "coingecko:ethereum";
+      const r = await fetch(`https://coins.llama.fi/prices/current/${idl}`);
+      const j = await r.json();
+      natifUsd = j.coins && j.coins[idl] ? j.coins[idl].price : natifUsd;
+    } catch (e) { /* on garde l'ancien */ }
+  }
+
+  // ── La capitalisation, EN UNITÉS DE QUOTE (natif, stable ou autre) ──
+  async function capEnQuote() {
+    if (kind === "courbe") {
+      // pons V2 : quoteReserve() / tokenReserve() × supply — même formule que le bot.
+      const [q, t] = await Promise.all([call(g("c"), "0x9da771f4"), call(g("c"), "0xcbcb3171")]);
+      const Q = words(q)[0], T = words(t)[0];
+      if (!T) return null;
+      return (Number(Q) / Number(T)) * (Number(supply) / 1e18) * 10 ** (18 - quoteDec);
+    }
+    if (kind === "v4") {
+      // StateView.getSlot0(poolId) → sqrtPriceX96 ; prix = (sqrt/2^96)², inversé si le token est currency1.
+      const r = await call(g("sv"), "0xc815641c" + pad(g("pid")));
+      const sqrt = words(r)[0];
+      const ratio = Number(sqrt) / 2 ** 96;
+      const p = ratio * ratio; // currency1 brut par currency0 brut
+      const quoteParToken = g("t0") === "1" ? p : 1 / p;
+      return quoteParToken * (Number(supply) / 1e18) * 10 ** (18 - quoteDec);
+    }
+    if (kind === "pancake") {
+      const [res, t0] = await Promise.all([call(g("pool"), "0x0902f1ac"), call(g("pool"), "0x0dfe1681")]);
+      const [r0, r1] = words(res);
+      const token0 = "0x" + t0.slice(-40);
+      const [jetons, q] = token0.toLowerCase() === token ? [r0, r1] : [r1, r0];
+      if (!jetons) return null;
+      return (Number(q) / Number(jetons)) * (Number(supply) / 1e18) * 10 ** (18 - quoteDec);
+    }
+    return null;
+  }
+  async function partDev() {
+    if (!dev) return null;
+    const r = await call(token, "0x70a08231" + pad(dev));
+    return (Number(words(r)[0]) / Number(supply)) * 100;
+  }
+
+  // ── Boucle : une lecture par seconde, jamais deux en même temps ──
+  const hist = []; let premiere = null, haut = null, bas = null, enCours = false, echecs = 0;
+  function dessine() {
+    const svg = $("spark"); if (hist.length < 2) return;
+    const min = Math.min(...hist), max = Math.max(...hist), span = max - min || 1;
+    const pts = hist.map((v, i) => `${(i / (hist.length - 1)) * 300},${56 - ((v - min) / span) * 50 - 3}`).join(" ");
+    svg.innerHTML = `<polyline fill="none" stroke="currentColor" stroke-width="2" points="${pts}"/>`;
+  }
+  async function tick() {
+    if (enCours) return; enCours = true;
+    try {
+      const [capQ, devPct, bloc] = await Promise.all([capEnQuote(), partDev().catch(() => null), rpc("eth_blockNumber", []).catch(() => null)]);
+      if (capQ === null || !Number.isFinite(capQ)) throw new Error("lecture vide");
+      let usd = null;
+      if (NATIF) usd = natifUsd === null ? null : capQ * natifUsd;
+      else if (STABLES.has(quote)) usd = capQ;
+      const affiche = usd !== null ? fmtUsd(usd) : `${capQ.toLocaleString("en-US", { maximumFractionDigits: 2 })} ${NATIF ? UNITE : "quote"}`;
+      const val = usd !== null ? usd : capQ;
+      if (premiere === null) { premiere = val; haut = val; bas = val; }
+      haut = Math.max(haut, val); bas = Math.min(bas, val);
+      hist.push(val); if (hist.length > 300) hist.shift();
+      const prev = $("cap").dataset.v ? Number($("cap").dataset.v) : val;
+      $("cap").textContent = affiche; $("cap").dataset.v = String(val);
+      $("cap").className = "cap " + (val > prev ? "up" : val < prev ? "down" : "");
+      $("capEth").textContent = NATIF ? `${capQ.toLocaleString("en-US", { maximumFractionDigits: 3 })} ${UNITE}` : "";
+      $("dev").textContent = devPct === null ? "—" : devPct < 0.05 ? "sorti" : fmtPct(devPct);
+      $("bloc").textContent = bloc ? Number(bloc).toLocaleString("en-US") : "—";
+      const d = premiere ? ((val / premiere) - 1) * 100 : 0;
+      $("delta").textContent = (d >= 0 ? "+" : "") + d.toLocaleString("en-US", { maximumFractionDigits: 1 }) + " %";
+      $("hl").textContent = usd !== null ? `${fmtUsd(haut)} / ${fmtUsd(bas)}` : "—";
+      $("heure").textContent = new Date().toLocaleTimeString("fr-FR");
+      $("etat").textContent = "en direct · 1 s"; $("dot").className = "dot"; echecs = 0;
+      dessine();
+    } catch (e) {
+      echecs += 1;
+      $("etat").textContent = `lecture ratée (${echecs}) — ${String(e.message || e).slice(0, 60)}`; $("dot").className = "dot off";
+    } finally { enCours = false; }
+  }
+  litNatifUsd().then(tick);
+  setInterval(litNatifUsd, 60_000);
+  setInterval(tick, 1_000);
+})();
+</script>
+</body>
+</html>
